@@ -1,0 +1,13 @@
+{
+  "name": "hanbeat-korean-lab",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A Korean-learning K-pop video study website with official pronunciation and extracted spoken audio clips.",
+  "scripts": {
+    "start": "node server.js",
+    "check": "node --check app.js && node --check server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
