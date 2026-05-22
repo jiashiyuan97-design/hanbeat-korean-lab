@@ -1,42 +1,44 @@
-const http = require("node:http");
-const fs = require("node:fs");
-const path = require("node:path");
-const { execFile } = require("node:child_process");
+      } catch (error) {
+        reject(error);
+      }
+    });
+    req.on("error", reject);
+  });
+}
 
-const root = __dirname;
-const port = Number(process.env.PORT || 4173);
-const audioCache = new Map();
-const captionCache = new Map();
-const ytDlpBinary = process.platform === "darwin"
-  ? path.join(root, "tools", "yt-dlp_macos")
-  : path.join(root, "tools", "yt-dlp");
-const ytDlpCommand = process.platform === "darwin" ? ytDlpBinary : "python3";
+function sendJson(res, status, payload) {
+  const body = JSON.stringify(payload);
+  res.writeHead(status, {
+    "content-type": "application/json; charset=utf-8",
+    "cache-control": "no-store",
+    "content-length": Buffer.byteLength(body)
+  });
+  res.end(body);
+}
 
-const mime = {
-  ".html": "text/html; charset=utf-8",
-  ".js": "application/javascript; charset=utf-8",
-  ".css": "text/css; charset=utf-8",
-  ".png": "image/png",
-  ".jpg": "image/jpeg",
-  ".jpeg": "image/jpeg",
-  ".mp3": "audio/mpeg",
-  ".m4a": "audio/mp4"
-};
+function usersPath() {
+  const dir = path.join(root, ".cache");
+  fs.mkdirSync(dir, { recursive: true });
+  return path.join(dir, "users.json");
+}
 
-const server = http.createServer(async (req, res) => {
+function readUsers() {
   try {
-    const url = new URL(req.url, `http://${req.headers.host}`);
-    if (url.pathname === "/api/naver-tts") return proxyNaver(url, res);
-    if (url.pathname === "/api/find-spoken-clip") return findSpokenClip(url, res);
-    if (url.pathname === "/api/group-clip") return groupClip(url, res);
-    if (url.pathname === "/api/group-audio") return groupAudio(url, res);
-    if (url.pathname === "/api/group-audio-source") return groupAudioSource(req, url, res);
-    return serveStatic(url, res);
-  } catch (error) {
-    res.writeHead(500, { "content-type": "application/json" });
-    res.end(JSON.stringify({ error: error.message }));
+    return JSON.parse(fs.readFileSync(usersPath(), "utf8"));
+  } catch {
+    return {};
   }
-});
+}
+
+function writeUsers(users) {
+  fs.writeFileSync(usersPath(), JSON.stringify(users, null, 2));
+}
+
+function normalizePhone(value) {
+  const digits = String(value || "").replace(/\D/g, "");
+  if (digits.length < 8 || digits.length > 15) return "";
+  return digits;
+}
 
 server.listen(port, () => {
   console.log(`Hanbeat server listening on http://127.0.0.1:${port}`);
@@ -143,59 +145,6 @@ async function groupClip(url, res) {
     res.writeHead(400, { "content-type": "application/json" });
     res.end(JSON.stringify({ error: "Missing videoId or text" }));
     return;
-  }
-  try {
-    const cues = await resolveCaptions(videoId);
-    const targets = buildCaptionTargets(text, example);
-    const match = cues.find((cue) => {
-      const normalized = normalizeKorean(cue.text);
-      return targets.some((target) => normalized.includes(target));
-    });
-    if (!match) {
-      res.writeHead(404, { "content-type": "application/json" });
-      res.end(JSON.stringify({ error: "没有找到可截取的成员原声音频片段" }));
-      return;
-    }
-    const start = Math.max(0, match.start - 0.18);
-    const end = Math.max(start + 1.8, Math.min(match.end + 0.28, match.start + 5.2));
-    const clipPath = await ensureClip(videoId, text, start, end);
-    serveAudioFile(clipPath, res);
-  } catch (error) {
-    res.writeHead(502, { "content-type": "application/json" });
-    res.end(JSON.stringify({ error: error.message }));
-  }
-}
-
-async function findSpokenClip(url, res) {
-  const videoId = url.searchParams.get("videoId");
-  const text = url.searchParams.get("text") || "";
-  const example = url.searchParams.get("example") || "";
-  if (!videoId || !text.trim()) {
-    res.writeHead(400, { "content-type": "application/json" });
-    res.end(JSON.stringify({ error: "Missing videoId or text" }));
-    return;
-  }
-  try {
-    const cues = await resolveCaptions(videoId);
-    const targets = buildCaptionTargets(text, example);
-    const match = cues.find((cue) => {
-      const normalized = normalizeKorean(cue.text);
-      return targets.some((target) => normalized.includes(target));
-    });
-    if (!match) {
-      res.writeHead(404, { "content-type": "application/json" });
-      res.end(JSON.stringify({ error: "没有在公开视频字幕时间轴里找到这个词的成员原声片段" }));
-      return;
-    }
-    const start = Math.max(0, match.start - 0.18);
-    const end = Math.max(start + 1.8, Math.min(match.end + 0.28, match.start + 5.2));
-    res.writeHead(200, { "content-type": "application/json", "cache-control": "public, max-age=3600" });
-    res.end(JSON.stringify({ videoId, text, start, end, cue: match.text, source: "youtube-caption" }));
-  } catch (error) {
-    res.writeHead(502, { "content-type": "application/json" });
-    res.end(JSON.stringify({ error: error.message }));
-  }
-}
 
 function buildCaptionTargets(text, example) {
   const pieces = [text, example, ...String(example || "").split(/\s+/), ...String(text || "").split(/\s+/)];
