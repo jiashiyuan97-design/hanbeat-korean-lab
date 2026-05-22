@@ -1,3 +1,103 @@
+const http = require("node:http");
+const fs = require("node:fs");
+const path = require("node:path");
+const { execFile } = require("node:child_process");
+
+const root = __dirname;
+const port = Number(process.env.PORT || 4173);
+const audioCache = new Map();
+const captionCache = new Map();
+const authCodes = new Map();
+const ytDlpBinary = process.platform === "darwin"
+  ? path.join(root, "tools", "yt-dlp_macos")
+  : path.join(root, "tools", "yt-dlp");
+const ytDlpCommand = process.platform === "darwin" ? ytDlpBinary : "python3";
+
+const mime = {
+  ".html": "text/html; charset=utf-8",
+  ".js": "application/javascript; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".mp3": "audio/mpeg",
+  ".m4a": "audio/mp4"
+};
+
+const server = http.createServer(async (req, res) => {
+  try {
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    if (url.pathname === "/api/auth/request-code") return requestAuthCode(req, res);
+    if (url.pathname === "/api/auth/verify-code") return verifyAuthCode(req, res);
+    if (url.pathname === "/api/auth/complete-profile") return completeProfile(req, res);
+    if (url.pathname === "/api/naver-tts") return proxyNaver(url, res);
+    if (url.pathname === "/api/find-spoken-clip") return findSpokenClip(url, res);
+    if (url.pathname === "/api/group-clip") return groupClip(url, res);
+    if (url.pathname === "/api/group-audio") return groupAudio(url, res);
+    if (url.pathname === "/api/group-audio-source") return groupAudioSource(req, url, res);
+    return serveStatic(url, res);
+  } catch (error) {
+    res.writeHead(500, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: error.message }));
+  }
+});
+
+async function requestAuthCode(req, res) {
+  const body = await readJson(req);
+  const phone = normalizePhone(body.phone);
+  if (!phone) return sendJson(res, 400, { error: "请输入有效手机号" });
+  const users = readUsers();
+  const code = String(Math.floor(100000 + Math.random() * 900000));
+  authCodes.set(phone, { code, expires: Date.now() + 10 * 60 * 1000 });
+  sendJson(res, 200, {
+    ok: true,
+    exists: Boolean(users[phone]),
+    devCode: process.env.SMS_PROVIDER ? undefined : code,
+    message: process.env.SMS_PROVIDER ? "验证码已发送" : "演示环境验证码已生成"
+  });
+}
+
+async function verifyAuthCode(req, res) {
+  const body = await readJson(req);
+  const phone = normalizePhone(body.phone);
+  const code = String(body.code || "").trim();
+  const record = authCodes.get(phone);
+  if (!phone || !code) return sendJson(res, 400, { error: "手机号和验证码不能为空" });
+  if (!record || record.expires < Date.now()) return sendJson(res, 400, { error: "验证码已过期，请重新获取" });
+  if (record.code !== code) return sendJson(res, 400, { error: "验证码不正确" });
+  const users = readUsers();
+  const user = users[phone] || null;
+  authCodes.delete(phone);
+  sendJson(res, 200, { ok: true, exists: Boolean(user), user });
+}
+
+async function completeProfile(req, res) {
+  const body = await readJson(req);
+  const phone = normalizePhone(body.phone);
+  const name = String(body.name || "").trim().slice(0, 24);
+  const avatar = String(body.avatar || "mint").replace(/[^a-z0-9-]/gi, "").slice(0, 24) || "mint";
+  if (!phone) return sendJson(res, 400, { error: "手机号无效" });
+  if (!name) return sendJson(res, 400, { error: "请输入用户名" });
+  const users = readUsers();
+  const user = users[phone] || { phone, createdAt: new Date().toISOString() };
+  user.name = name;
+  user.avatar = avatar;
+  user.updatedAt = new Date().toISOString();
+  users[phone] = user;
+  writeUsers(users);
+  sendJson(res, 200, { ok: true, user });
+}
+
+function readJson(req) {
+  return new Promise((resolve, reject) => {
+    let raw = "";
+    req.on("data", (chunk) => {
+      raw += chunk;
+      if (raw.length > 1024 * 1024) req.destroy();
+    });
+    req.on("end", () => {
+      try {
+        resolve(raw ? JSON.parse(raw) : {});
       } catch (error) {
         reject(error);
       }
@@ -145,6 +245,59 @@ async function groupClip(url, res) {
     res.writeHead(400, { "content-type": "application/json" });
     res.end(JSON.stringify({ error: "Missing videoId or text" }));
     return;
+  }
+  try {
+    const cues = await resolveCaptions(videoId);
+    const targets = buildCaptionTargets(text, example);
+    const match = cues.find((cue) => {
+      const normalized = normalizeKorean(cue.text);
+      return targets.some((target) => normalized.includes(target));
+    });
+    if (!match) {
+      res.writeHead(404, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "没有找到可截取的成员原声音频片段" }));
+      return;
+    }
+    const start = Math.max(0, match.start - 0.18);
+    const end = Math.max(start + 1.8, Math.min(match.end + 0.28, match.start + 5.2));
+    const clipPath = await ensureClip(videoId, text, start, end);
+    serveAudioFile(clipPath, res);
+  } catch (error) {
+    res.writeHead(502, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: error.message }));
+  }
+}
+
+async function findSpokenClip(url, res) {
+  const videoId = url.searchParams.get("videoId");
+  const text = url.searchParams.get("text") || "";
+  const example = url.searchParams.get("example") || "";
+  if (!videoId || !text.trim()) {
+    res.writeHead(400, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "Missing videoId or text" }));
+    return;
+  }
+  try {
+    const cues = await resolveCaptions(videoId);
+    const targets = buildCaptionTargets(text, example);
+    const match = cues.find((cue) => {
+      const normalized = normalizeKorean(cue.text);
+      return targets.some((target) => normalized.includes(target));
+    });
+    if (!match) {
+      res.writeHead(404, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "没有在公开视频字幕时间轴里找到这个词的成员原声片段" }));
+      return;
+    }
+    const start = Math.max(0, match.start - 0.18);
+    const end = Math.max(start + 1.8, Math.min(match.end + 0.28, match.start + 5.2));
+    res.writeHead(200, { "content-type": "application/json", "cache-control": "public, max-age=3600" });
+    res.end(JSON.stringify({ videoId, text, start, end, cue: match.text, source: "youtube-caption" }));
+  } catch (error) {
+    res.writeHead(502, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: error.message }));
+  }
+}
 
 function buildCaptionTargets(text, example) {
   const pieces = [text, example, ...String(example || "").split(/\s+/), ...String(text || "").split(/\s+/)];
