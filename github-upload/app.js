@@ -1,4 +1,4 @@
-const STORE_KEY = "hanbeat-korean-lab-v2";
+const STORE_KEY = "hanbeat-korean-lab-v3";
 const OLD_STORE_KEY = "hanbeat-korean-lab-v1";
 
 const jamo = {
@@ -600,6 +600,9 @@ const seedUsers = {
 };
 
 let state = loadState();
+if (state.loggedIn && !state.users[state.activeUser]?.phone) {
+  state.loggedIn = false;
+}
 let route = state.loggedIn ? (activeUser().selectedBand ? "home" : "bands") : "login";
 let selectedBand = activeUser()?.selectedBand || "svt";
 let selectedVideo = firstVideoForBand(selectedBand)?.id || "svt-super";
@@ -614,10 +617,13 @@ let quiz = null;
 let activeAudio = null;
 let playingTerm = "";
 let queue = { active: false, mode: "official", terms: [], index: -1 };
+let authDraft = { step: "phone", phone: "", code: "", isNew: false, devCode: "", message: "", avatar: "mint" };
 
 function createSeedUser(name, band, points, learned, wrong, review) {
   return {
     name,
+    avatar: "mint",
+    phone: "",
     selectedBand: band,
     points,
     bandPoints: { [band]: points },
@@ -651,7 +657,9 @@ function migrateOldState(old) {
 }
 
 function normalizeUser(user) {
-  user.selectedBand ||= "svt";
+  if (user.selectedBand === undefined) user.selectedBand = "svt";
+  user.avatar ||= "mint";
+  user.phone ||= "";
   user.points ||= 0;
   user.bandPoints ||= { [user.selectedBand]: user.points };
   user.learned ||= [];
@@ -667,6 +675,10 @@ function saveState() {
 
 function activeUser() {
   return state.users[state.activeUser];
+}
+
+function avatarLabel(user) {
+  return (user?.name || "H").trim().slice(0, 1).toUpperCase();
 }
 
 function currentBand() {
@@ -1325,6 +1337,90 @@ function createUser(name, bandId) {
   setToast(`欢迎 ${clean}，请选择你的学习团体`);
 }
 
+function phoneUserId(phone) {
+  return `phone-${String(phone || "").replace(/\D/g, "")}`;
+}
+
+function createPhoneUser(profile) {
+  const user = createSeedUser(profile.name || "Hanbeat", "", 0, [], [], []);
+  user.phone = profile.phone;
+  user.avatar = profile.avatar || "mint";
+  user.selectedBand = "";
+  user.progress = {};
+  return user;
+}
+
+function loginPhoneUser(profile) {
+  const id = phoneUserId(profile.phone);
+  const existing = state.users[id];
+  state.users[id] = existing ? { ...existing, name: profile.name || existing.name, phone: profile.phone, avatar: profile.avatar || existing.avatar || "mint" } : createPhoneUser(profile);
+  normalizeUser(state.users[id]);
+  state.activeUser = id;
+  state.loggedIn = true;
+  selectedBand = state.users[id].selectedBand || "svt";
+  selectedVideo = firstVideoForBand(selectedBand).id;
+  route = state.users[id].selectedBand ? "home" : "bands";
+  saveState();
+  setToast(state.users[id].selectedBand ? `欢迎回来，${state.users[id].name}` : "请选择你想学习的团体");
+}
+
+async function postJson(url, body) {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body)
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error || "请求失败，请稍后再试");
+  return data;
+}
+
+async function requestPhoneCode(phone) {
+  const clean = String(phone || "").replace(/\D/g, "");
+  if (clean.length < 8) return setToast("请输入有效手机号");
+  try {
+    const data = await postJson("/api/auth/request-code", { phone: clean });
+    authDraft = {
+      ...authDraft,
+      step: "code",
+      phone: clean,
+      isNew: !data.exists,
+      devCode: data.devCode || "",
+      message: data.devCode ? `演示验证码：${data.devCode}` : data.message || "验证码已发送"
+    };
+    setToast(data.devCode ? `演示验证码：${data.devCode}` : "验证码已发送");
+    render();
+  } catch (error) {
+    setToast(error.message);
+  }
+}
+
+async function verifyPhoneCode(code) {
+  try {
+    const data = await postJson("/api/auth/verify-code", { phone: authDraft.phone, code });
+    if (data.exists && data.user) {
+      loginPhoneUser(data.user);
+      render();
+      return;
+    }
+    authDraft = { ...authDraft, step: "profile", code: "", message: "设置用户名和头像后开始学习" };
+    render();
+  } catch (error) {
+    setToast(error.message);
+  }
+}
+
+async function completePhoneProfile(name, avatar) {
+  try {
+    const data = await postJson("/api/auth/complete-profile", { phone: authDraft.phone, name, avatar });
+    loginPhoneUser(data.user);
+    route = "bands";
+    render();
+  } catch (error) {
+    setToast(error.message);
+  }
+}
+
 function loginUser(userId) {
   state.activeUser = userId;
   state.loggedIn = true;
@@ -1406,26 +1502,55 @@ function render() {
 }
 
 function renderLogin() {
+  const avatarOptions = [
+    ["mint", "#58cc02"],
+    ["sky", "#1cb0f6"],
+    ["gold", "#ffc800"],
+    ["rose", "#ff7aa2"]
+  ];
   return `
-    <main class="login-screen">
-      <section class="login-visual">
-        <div class="brand login-brand"><div class="mark">한</div><div><strong>Hanbeat Korean Lab</strong><span>K-pop video Korean learning</span></div></div>
+    <main class="entry-screen">
+      <section class="entry-hero" aria-hidden="true">
+        <div class="entry-brand"><div class="mark">한</div><strong>Hanbeat</strong></div>
+        <div class="lesson-stack">
+          <div class="lesson-card primary-card"><b>안녕하세요</b><span>你好</span></div>
+          <div class="lesson-card"><b>무대</b><span>舞台</span></div>
+          <div class="lesson-card"><b>같이 배워요</b><span>一起学习吧</span></div>
+        </div>
       </section>
-      <section class="card login-panel">
-        <div class="tabs"><button class="pill-button active">登录</button><button class="pill-button">注册</button></div>
-        <form id="loginForm">
-          <label>已有账号</label>
-          <select id="loginUserId">${Object.entries(state.users).map(([id, user]) => `<option value="${id}">${user.name}</option>`).join("")}</select>
-          <button class="primary" type="submit">登录学习</button>
-        </form>
-        <div class="divider"></div>
-        <form id="registerForm">
-          <label>新账号昵称</label>
-          <input id="newUserName" type="text" placeholder="例如 CaratMomo" autocomplete="off" />
-          <label>注册后先学习</label>
-          <select id="registerBand">${bands.map((band) => `<option value="${band.id}">${band.name}</option>`).join("")}</select>
-          <button class="secondary" type="submit">注册并选择团体</button>
-        </form>
+      <section class="entry-panel">
+        <div class="entry-copy">
+          <p class="eyebrow">K-pop Korean Lab</p>
+          <h1>用手机号开始学习韩语</h1>
+        </div>
+        ${authDraft.step === "phone" ? `
+          <form id="phoneForm" class="auth-flow">
+            <label>手机号</label>
+            <input id="phoneInput" type="tel" inputmode="numeric" autocomplete="tel" placeholder="输入手机号" value="${authDraft.phone}" />
+            <button class="entry-primary" type="submit">继续</button>
+          </form>
+        ` : ""}
+        ${authDraft.step === "code" ? `
+          <form id="codeForm" class="auth-flow">
+            <button class="text-link" type="button" data-auth-back>← 更换手机号</button>
+            <label>验证码已发送到 ${authDraft.phone}</label>
+            <input id="codeInput" type="text" inputmode="numeric" autocomplete="one-time-code" placeholder="6 位验证码" value="${authDraft.devCode}" />
+            ${authDraft.message ? `<p class="auth-note">${authDraft.message}</p>` : ""}
+            <button class="entry-primary" type="submit">${authDraft.isNew ? "验证并注册" : "登录"}</button>
+          </form>
+        ` : ""}
+        ${authDraft.step === "profile" ? `
+          <form id="profileForm" class="auth-flow">
+            <label>用户名</label>
+            <input id="profileName" type="text" maxlength="24" autocomplete="nickname" placeholder="给自己起一个学习名" />
+            <label>头像颜色</label>
+            <div class="avatar-picker">
+              ${avatarOptions.map(([id, color]) => `<button class="avatar-choice ${authDraft.avatar === id ? "active" : ""}" type="button" data-avatar="${id}" style="--avatar:${color}"><span>${id.slice(0, 1).toUpperCase()}</span></button>`).join("")}
+            </div>
+            <button class="entry-primary" type="submit">创建账号</button>
+          </form>
+        ` : ""}
+        ${state.toast ? `<div class="entry-toast">${state.toast}</div>` : ""}
       </section>
     </main>
   `;
@@ -1447,6 +1572,7 @@ function renderTopbar(user) {
         ${navButton("leaderboard", "积分排行")}
       </nav>
       <div class="account">
+        <span class="mini-avatar ${user.avatar || "mint"}">${avatarLabel(user)}</span>
         <span class="badge">${user.points} 总分</span>
         <button class="ghost" data-logout>退出</button>
       </div>
@@ -1673,8 +1799,11 @@ function bandDisplayName(band) {
 function bindEvents() {
   document.querySelectorAll("[data-route]").forEach((button) => button.addEventListener("click", () => { route = button.dataset.route; render(); }));
   document.querySelector("[data-logout]")?.addEventListener("click", () => { state.loggedIn = false; saveState(); route = "login"; render(); });
-  document.querySelector("#loginForm")?.addEventListener("submit", (event) => { event.preventDefault(); loginUser(document.querySelector("#loginUserId").value); });
-  document.querySelector("#registerForm")?.addEventListener("submit", (event) => { event.preventDefault(); createUser(document.querySelector("#newUserName").value, document.querySelector("#registerBand").value); });
+  document.querySelector("#phoneForm")?.addEventListener("submit", (event) => { event.preventDefault(); requestPhoneCode(document.querySelector("#phoneInput").value); });
+  document.querySelector("#codeForm")?.addEventListener("submit", (event) => { event.preventDefault(); verifyPhoneCode(document.querySelector("#codeInput").value); });
+  document.querySelector("#profileForm")?.addEventListener("submit", (event) => { event.preventDefault(); completePhoneProfile(document.querySelector("#profileName").value, authDraft.avatar); });
+  document.querySelector("[data-auth-back]")?.addEventListener("click", () => { authDraft = { step: "phone", phone: authDraft.phone, code: "", isNew: false, devCode: "", message: "", avatar: authDraft.avatar || "mint" }; render(); });
+  document.querySelectorAll("[data-avatar]").forEach((button) => button.addEventListener("click", () => { authDraft.avatar = button.dataset.avatar; render(); }));
   document.querySelectorAll("[data-choose-band]").forEach((button) => button.addEventListener("click", () => chooseBand(button.dataset.chooseBand)));
   document.querySelectorAll("[data-company-filter]").forEach((button) => button.addEventListener("click", () => { companyFilter = button.dataset.companyFilter; render(); }));
   document.querySelectorAll("[data-open-video]").forEach((button) => button.addEventListener("click", () => { selectedVideo = button.dataset.openVideo; route = "learn"; render(); }));
